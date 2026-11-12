@@ -649,7 +649,7 @@ class PromptBoxApp(tk.Tk):
             self._label(line, value, 9, bold=True).pack(side="right")
 
     def new_prompt(self):
-        dialog = PromptDialog(self, self.store.categories(), self.c)
+        dialog = PromptDialog(self, sorted(set(self.store.categories() + self.settings.get("custom_categories", []))), self.c)
         self.wait_window(dialog)
         if dialog.result:
             self.store.save(*dialog.result)
@@ -663,7 +663,7 @@ class PromptBoxApp(tk.Tk):
         prompt = self.store.get(self.selected_id)
         if not prompt:
             return
-        dialog = PromptDialog(self, self.store.categories(), self.c, prompt)
+        dialog = PromptDialog(self, sorted(set(self.store.categories() + self.settings.get("custom_categories", []))), self.c, prompt)
         self.wait_window(dialog)
         if dialog.result:
             self.store.save(*dialog.result, prompt_id=self.selected_id)
@@ -698,13 +698,14 @@ class PromptBoxApp(tk.Tk):
         if not name or not name.strip():
             return
         name = name.strip()
-        if name in self.store.categories():
+        if name.casefold() in {item.casefold() for item in (self.store.categories() + self.settings.get("custom_categories", []))}:
             messagebox.showwarning("Categoría existente", "Ya existe esa categoría.")
             return
         # Category names are represented by prompt rows; create a placeholder-less category
         # in settings metadata so it persists independently.
         custom = self.settings.setdefault("custom_categories", [])
         custom.append(name)
+        custom.sort(key=str.casefold)
         self._save_settings()
         self.show_view("categories")
 
