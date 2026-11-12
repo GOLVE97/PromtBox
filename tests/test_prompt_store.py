@@ -56,7 +56,10 @@ class PromptStoreTests(unittest.TestCase):
         self.store.save("Résumé", "Keep accents ✓", "Personal", "important", True)
         backup = Path(self.temp.name) / "backup.json"
         self.store.export_data(backup)
-        target = promptbox.PromptStore()
+        target_dir = Path(self.temp.name) / "target"
+        target_db = target_dir / "prompts.db"
+        with patch.object(promptbox, "DATA_DIR", target_dir), patch.object(promptbox, "DB_PATH", target_db):
+            target = promptbox.PromptStore()
         try:
             count = target.import_data(backup)
             self.assertEqual(count, 1)
