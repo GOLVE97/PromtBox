@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+import tempfile
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from pathlib import Path
@@ -7,7 +9,7 @@ from datetime import datetime
 import sys
 
 APP_NAME = "PromptBox"
-APP_VERSION = "0.5.0"
+APP_VERSION = "1.0.0"
 DATA_DIR = Path.home() / "AppData" / "Local" / APP_NAME
 DB_PATH = DATA_DIR / "prompts.db"
 SETTINGS_PATH = DATA_DIR / "settings.json"
@@ -24,6 +26,112 @@ if sys.platform == "win32":
 def resource_path(relative_path):
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base_path / relative_path
+
+
+def unique_category_names(categories):
+    """Return non-empty category names without case-insensitive duplicates."""
+    if not isinstance(categories, (list, tuple, set)):
+        return []
+    unique = {}
+    for category in categories:
+        if not isinstance(category, str):
+            continue
+        name = category.strip()
+        if name:
+            unique.setdefault(name.casefold(), name)
+    return sorted(unique.values(), key=str.casefold)
+
+
+def canonical_category_name(value, known_categories=()):
+    """Reuse an existing category's spelling when a name differs only by case."""
+    name = value.strip() if isinstance(value, str) else ""
+    if not name:
+        name = "General"
+    known = unique_category_names(
+        list(known_categories) if isinstance(known_categories, (list, tuple, set)) else []
+    )
+    exact = next((category for category in known if category == name), None)
+    if exact is not None:
+        return exact
+    return next((category for category in known if category.casefold() == name.casefold()), name)
+
+
+def validate_category_name(value, existing_categories, exclude=None):
+    """Validate a category name, rejecting duplicates regardless of capitalization."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Escribe un nombre para la categoría.")
+    name = value.strip()
+    for category in unique_category_names(existing_categories):
+        if category.casefold() == name.casefold() and category != exclude:
+            raise ValueError("Ya existe una categoría con ese nombre.")
+    return name
+
+
+def write_json_atomically(path, payload):
+    """Write JSON through a temporary sibling file so a failed write cannot truncate data."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(serialized)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def load_settings(path):
+    """Load and sanitize settings so damaged or old preferences cannot prevent startup."""
+    defaults = {
+        "theme": "dark",
+        "confirm_delete": True,
+        "language": "Español",
+        "custom_categories": [],
+        "hidden_categories": [],
+    }
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(payload, dict):
+        return defaults
+
+    settings = dict(defaults)
+    settings.update(payload)
+    if not isinstance(settings.get("theme"), str) or settings.get("theme") not in {"dark", "light", "system"}:
+        settings["theme"] = "dark"
+    if not isinstance(settings.get("confirm_delete"), bool):
+        settings["confirm_delete"] = True
+    if not isinstance(settings.get("language"), str):
+        settings["language"] = "Español"
+
+    default_by_key = {category.casefold(): category for category in DEFAULT_CATEGORIES}
+    hidden = unique_category_names(settings.get("hidden_categories"))
+    settings["hidden_categories"] = unique_category_names(
+        [
+            default_by_key[name.casefold()] for name in hidden
+            if name.casefold() in default_by_key and name.casefold() != "general"
+        ]
+    )
+    hidden_keys = {name.casefold() for name in settings["hidden_categories"]}
+    custom = unique_category_names(settings.get("custom_categories"))
+    settings["custom_categories"] = [
+        name for name in custom
+        if name.casefold() not in default_by_key or name.casefold() in hidden_keys
+    ]
+    return settings
 
 
 THEMES = {
@@ -81,7 +189,11 @@ class PromptStore:
     def get(self, prompt_id):
         return self.conn.execute("SELECT * FROM prompts WHERE id=?", (prompt_id,)).fetchone()
 
-    def save(self, title, content, category, tags="", favorite=False, prompt_id=None):
+    def save(self, title, content, category, tags="", favorite=False, prompt_id=None, known_categories=()):
+        database_categories = [
+            row["category"] for row in self.conn.execute("SELECT DISTINCT category FROM prompts")
+        ]
+        category = canonical_category_name(category, list(known_categories or []) + database_categories)
         now = datetime.now().isoformat(timespec="seconds")
         if prompt_id:
             self.conn.execute(
@@ -99,19 +211,26 @@ class PromptStore:
         self.conn.execute("DELETE FROM prompts WHERE id=?", (prompt_id,))
         self.conn.commit()
 
-    def categories(self):
+    def categories(self, custom_categories=(), hidden_categories=()):
         rows = self.conn.execute("SELECT DISTINCT category FROM prompts ORDER BY category").fetchall()
-        return sorted(set(DEFAULT_CATEGORIES + [r["category"] for r in rows]))
+        hidden_keys = {name.casefold() for name in unique_category_names(hidden_categories)}
+        defaults = [name for name in DEFAULT_CATEGORIES if name.casefold() not in hidden_keys]
+        return unique_category_names(defaults + [r["category"] for r in rows] + list(custom_categories or []))
 
     def category_counts(self):
         return self.conn.execute(
             "SELECT category, COUNT(*) AS total FROM prompts GROUP BY category ORDER BY category"
         ).fetchall()
 
-    def rename_category(self, old, new):
+    def rename_category(self, old, new, known_categories=()):
+        database_categories = [
+            row["category"] for row in self.conn.execute("SELECT DISTINCT category FROM prompts")
+        ]
+        new = validate_category_name(new, list(known_categories or []) + database_categories, exclude=old)
         self.conn.execute("UPDATE prompts SET category=?, updated_at=? WHERE category=?",
                           (new, datetime.now().isoformat(timespec="seconds"), old))
         self.conn.commit()
+        return new
 
     def delete_category(self, category):
         self.conn.execute("UPDATE prompts SET category='General', updated_at=? WHERE category=?",
@@ -124,29 +243,64 @@ class PromptStore:
         favs = self.conn.execute("SELECT COUNT(*) FROM prompts WHERE is_favorite=1").fetchone()[0]
         return total, cats, favs
 
-    def export_data(self, path):
+    def export_data(self, path, custom_categories=(), hidden_categories=()):
         rows = self.conn.execute(
             "SELECT title, content, category, created_at, updated_at, tags, is_favorite FROM prompts ORDER BY id"
         ).fetchall()
-        payload = {"app": APP_NAME, "version": 2, "exported_at": datetime.now().isoformat(),
-                   "prompts": [dict(r) for r in rows]}
-        Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = {
+            "app": APP_NAME,
+            "version": 3,
+            "exported_at": datetime.now().isoformat(),
+            "categories": self.categories(custom_categories, hidden_categories),
+            "prompts": [dict(r) for r in rows],
+        }
+        write_json_atomically(path, payload)
 
-    def import_data(self, path):
+    def import_data(self, path, custom_categories=(), hidden_categories=()):
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        prompts = payload.get("prompts") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            raise ValueError("El archivo no contiene un respaldo válido de PromptBox.")
+        prompts = payload.get("prompts")
         if not isinstance(prompts, list):
             raise ValueError("El archivo no contiene una lista válida de prompts.")
+
+        known_categories = self.categories(custom_categories, hidden_categories)
+        available_categories = list(known_categories)
+        imported_categories = []
+        source_categories = payload.get("categories", [])
+        if isinstance(source_categories, list):
+            for category in source_categories:
+                if not isinstance(category, str) or not category.strip():
+                    continue
+                canonical = canonical_category_name(category, available_categories)
+                if canonical.casefold() not in {name.casefold() for name in available_categories}:
+                    imported_categories.append(canonical)
+                    available_categories.append(canonical)
+
         valid = []
         for item in prompts:
             if not isinstance(item, dict):
                 continue
-            title = str(item.get("title", "")).strip()
-            content = str(item.get("content", "")).strip()
-            category = str(item.get("category", "General")).strip() or "General"
+            title_value = item.get("title", "")
+            content_value = item.get("content", "")
+            if not isinstance(title_value, str) or not isinstance(content_value, str):
+                continue
+            title = title_value.strip()
+            content = content_value.strip()
+            category_value = item.get("category", "General")
+            category = canonical_category_name(
+                category_value if isinstance(category_value, str) else "General",
+                available_categories,
+            )
+            tags_value = item.get("tags", "")
+            tags = tags_value if isinstance(tags_value, str) else ""
+            favorite_value = item.get("is_favorite", False)
+            favorite = int(favorite_value is True or (type(favorite_value) is int and favorite_value == 1))
             if title and content:
-                valid.append((title, content, category, str(item.get("tags", "")),
-                              int(bool(item.get("is_favorite", False)))))
+                valid.append((title, content, category, tags, favorite))
+                if category.casefold() not in {name.casefold() for name in available_categories}:
+                    imported_categories.append(category)
+                    available_categories.append(category)
         now = datetime.now().isoformat(timespec="seconds")
         with self.conn:
             for title, content, category, tags, favorite in valid:
@@ -154,13 +308,14 @@ class PromptStore:
                     "INSERT INTO prompts(title, content, category, created_at, updated_at, tags, is_favorite) VALUES(?,?,?,?,?,?,?)",
                     (title, content, category, now, now, tags, favorite)
                 )
-        return len(valid)
+        return len(valid), unique_category_names(imported_categories)
 
 
 class PromptDialog(tk.Toplevel):
     def __init__(self, parent, categories, colors, prompt=None):
         super().__init__(parent)
         self.result = None
+        self.categories = list(categories)
         self.c = colors
         self.title("Editar prompt" if prompt else "Nuevo prompt")
         self.geometry("720x650")
@@ -185,7 +340,7 @@ class PromptDialog(tk.Toplevel):
         self.title_entry = self._entry(outer, self.title_var)
         self.title_entry.pack(fill="x", pady=(5, 14))
         self._label(outer, "Categoría *")
-        self.category_box = ttk.Combobox(outer, textvariable=self.category_var, values=categories, state="normal")
+        self.category_box = ttk.Combobox(outer, textvariable=self.category_var, values=self.categories, state="normal")
         self.category_box.pack(fill="x", pady=(5, 14), ipady=5)
         self._label(outer, "Contenido del prompt *")
         self.content = tk.Text(outer, height=12, wrap="word", font=("Segoe UI", 10),
@@ -230,7 +385,7 @@ class PromptDialog(tk.Toplevel):
     def save(self):
         title = self.title_var.get().strip()
         content = self.content.get("1.0", "end-1c").strip()
-        category = self.category_var.get().strip() or "General"
+        category = canonical_category_name(self.category_var.get(), self.categories)
         tags = self.tags_var.get().strip()
         if not title or not content:
             messagebox.showwarning("Faltan datos", "Escribe un título y el contenido del prompt.", parent=self)
@@ -266,14 +421,16 @@ class PromptBoxApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _load_settings(self):
-        try:
-            return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {"theme": "dark", "confirm_delete": True, "language": "Español"}
+        return load_settings(SETTINGS_PATH)
 
     def _save_settings(self):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomically(SETTINGS_PATH, self.settings)
+
+    def _all_categories(self):
+        return self.store.categories(
+            self.settings.get("custom_categories", []),
+            self.settings.get("hidden_categories", []),
+        )
 
     def _colors(self):
         if self.theme_name == "system":
@@ -460,7 +617,7 @@ class PromptBoxApp(tk.Tk):
         ent.bind("<KeyRelease>", lambda _e: self._populate_tree(self.library_tree, self.library_search.get()))
         self.library_category = tk.StringVar(value="Todas")
         combo = ttk.Combobox(toolbar, textvariable=self.library_category,
-                             values=["Todas"] + sorted(set(self.store.categories() + self.settings.get("custom_categories", []))), state="readonly", width=18)
+                             values=["Todas"] + self._all_categories(), state="readonly", width=18)
         combo.pack(side="left", ipady=5, padx=(0, 10))
         combo.bind("<<ComboboxSelected>>", lambda _e: self._populate_tree(self.library_tree, self.library_search.get()))
         self._button(toolbar, "Importar", self.import_data).pack(side="left", padx=(0, 8))
@@ -557,7 +714,7 @@ class PromptBoxApp(tk.Tk):
         tree.pack(fill="both", expand=True)
         self.category_tree = tree
         counts = {row["category"]: row["total"] for row in self.store.category_counts()}
-        all_categories = sorted(set(self.store.categories() + self.settings.get("custom_categories", [])))
+        all_categories = self._all_categories()
         for category in all_categories:
             tree.insert("", "end", iid=category, values=(category, counts.get(category, 0)))
         actions = tk.Frame(panel, bg=self.c["panel"])
@@ -649,10 +806,10 @@ class PromptBoxApp(tk.Tk):
             self._label(line, value, 9, bold=True).pack(side="right")
 
     def new_prompt(self):
-        dialog = PromptDialog(self, sorted(set(self.store.categories() + self.settings.get("custom_categories", []))), self.c)
+        dialog = PromptDialog(self, self._all_categories(), self.c)
         self.wait_window(dialog)
         if dialog.result:
-            self.store.save(*dialog.result)
+            self.store.save(*dialog.result, known_categories=self._all_categories())
             self.show_view("library")
             self.status_var.set("Prompt creado correctamente")
 
@@ -663,10 +820,10 @@ class PromptBoxApp(tk.Tk):
         prompt = self.store.get(self.selected_id)
         if not prompt:
             return
-        dialog = PromptDialog(self, sorted(set(self.store.categories() + self.settings.get("custom_categories", []))), self.c, prompt)
+        dialog = PromptDialog(self, self._all_categories(), self.c, prompt)
         self.wait_window(dialog)
         if dialog.result:
-            self.store.save(*dialog.result, prompt_id=self.selected_id)
+            self.store.save(*dialog.result, prompt_id=self.selected_id, known_categories=self._all_categories())
             self.show_view(self.current_view)
             self.status_var.set("Cambios guardados")
 
@@ -697,35 +854,51 @@ class PromptBoxApp(tk.Tk):
         name = simpledialog.askstring("Nueva categoría", "Nombre de la categoría:", parent=self)
         if not name or not name.strip():
             return
-        name = name.strip()
-        if name.casefold() in {item.casefold() for item in (self.store.categories() + self.settings.get("custom_categories", []))}:
-            messagebox.showwarning("Categoría existente", "Ya existe esa categoría.")
+        try:
+            name = validate_category_name(name, self._all_categories())
+        except ValueError as exc:
+            messagebox.showwarning("Categoría existente", str(exc), parent=self)
             return
-        # Category names are represented by prompt rows; create a placeholder-less category
-        # in settings metadata so it persists independently.
         custom = self.settings.setdefault("custom_categories", [])
         custom.append(name)
-        custom.sort(key=str.casefold)
+        self.settings["custom_categories"] = unique_category_names(custom)
         self._save_settings()
         self.show_view("categories")
 
     def rename_category(self):
         selection = self.category_tree.selection()
         if not selection:
-            messagebox.showinfo("Selecciona categoría", "Selecciona una categoría con prompts para renombrar.")
+            messagebox.showinfo("Selecciona categoría", "Selecciona una categoría para renombrar.", parent=self)
             return
         old = selection[0]
+        if old.casefold() == "general":
+            messagebox.showwarning("Acción no permitida", "La categoría General no se puede renombrar.", parent=self)
+            return
         from tkinter import simpledialog
         new = simpledialog.askstring("Renombrar categoría", "Nuevo nombre:", initialvalue=old, parent=self)
-        if not new or not new.strip() or new.strip() == old:
+        if not new or not new.strip() or new.strip().casefold() == old.casefold():
             return
-        new = new.strip()
-        self.store.rename_category(old, new)
-        custom = self.settings.setdefault("custom_categories", [])
-        if old in custom:
-            custom.remove(old)
-        if new not in DEFAULT_CATEGORIES:
+        try:
+            new = validate_category_name(new, self._all_categories(), exclude=old)
+            self.store.rename_category(old, new, known_categories=self._all_categories())
+        except ValueError as exc:
+            messagebox.showwarning("Nombre no disponible", str(exc), parent=self)
+            return
+
+        custom = [
+            category for category in self.settings.get("custom_categories", [])
+            if category.casefold() != old.casefold()
+        ]
+        hidden = list(self.settings.get("hidden_categories", []))
+        default_by_key = {category.casefold(): category for category in DEFAULT_CATEGORIES}
+        if old.casefold() in default_by_key:
+            hidden.append(default_by_key[old.casefold()])
+        if new.casefold() in default_by_key:
+            hidden = [category for category in hidden if category.casefold() != new.casefold()]
+        else:
             custom.append(new)
+        self.settings["custom_categories"] = unique_category_names(custom)
+        self.settings["hidden_categories"] = unique_category_names(hidden)
         self._save_settings()
         self.show_view("categories")
 
@@ -735,15 +908,21 @@ class PromptBoxApp(tk.Tk):
             messagebox.showinfo("Selecciona categoría", "Selecciona una categoría.")
             return
         category = selection[0]
-        if category == "General":
+        if category.casefold() == "general":
             messagebox.showwarning("Acción no permitida", "La categoría General no se puede eliminar.")
             return
         if not messagebox.askyesno("Eliminar categoría", f"Los prompts de «{category}» pasarán a General. ¿Continuar?"):
             return
         self.store.delete_category(category)
-        custom = self.settings.setdefault("custom_categories", [])
-        if category in custom:
-            custom.remove(category)
+        self.settings["custom_categories"] = [
+            item for item in self.settings.get("custom_categories", [])
+            if item.casefold() != category.casefold()
+        ]
+        default_by_key = {item.casefold(): item for item in DEFAULT_CATEGORIES}
+        if category.casefold() in default_by_key:
+            hidden = self.settings.setdefault("hidden_categories", [])
+            hidden.append(default_by_key[category.casefold()])
+            self.settings["hidden_categories"] = unique_category_names(hidden)
         self._save_settings()
         self.show_view("categories")
 
@@ -771,7 +950,11 @@ class PromptBoxApp(tk.Tk):
         if not path:
             return
         try:
-            self.store.export_data(path)
+            self.store.export_data(
+                path,
+                self.settings.get("custom_categories", []),
+                self.settings.get("hidden_categories", []),
+            )
             messagebox.showinfo("Exportación completa", "Tu biblioteca se exportó correctamente.")
             self.status_var.set("Respaldo exportado")
         except Exception as exc:
@@ -785,7 +968,15 @@ class PromptBoxApp(tk.Tk):
                                    "Los prompts del archivo se agregarán a tu biblioteca. ¿Continuar?"):
             return
         try:
-            count = self.store.import_data(path)
+            count, imported_categories = self.store.import_data(
+                path,
+                self.settings.get("custom_categories", []),
+                self.settings.get("hidden_categories", []),
+            )
+            if imported_categories:
+                custom = self.settings.setdefault("custom_categories", [])
+                self.settings["custom_categories"] = unique_category_names(custom + imported_categories)
+                self._save_settings()
             self.show_view("library")
             messagebox.showinfo("Importación completa", f"Se importaron {count} prompt(s).")
             self.status_var.set(f"{count} prompt(s) importados")
