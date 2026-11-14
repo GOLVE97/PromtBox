@@ -47,6 +47,6 @@ Para generar el ejecutable en Windows, ejecuta `build.bat`. Si PyInstaller no es
 
 El flujo **Build and test Windows app** de GitHub Actions ejecuta las pruebas antes de compilar y conserva el ejecutable como artefacto durante 30 días.
 
-## Estado de la versión
+## Distribución
 
-Versión 1.0.0 en preparación. El paquete generado es un ZIP portable de Windows x64; no es un instalador firmado ni un paquete MSIX de Microsoft Store. TinyDock (`tinydock.pro`) publica fichas de proyectos y enlaza las descargas externamente: no aloja ni distribuye ejecutables. La ficha de PromptBox debe apuntar a un enlace público estable para el ZIP, como el activo de un release de GitHub. El paquete todavía no tiene ese enlace y no se ha enviado la ficha.
+PromptBox 1.0.0 se distribuye como un ZIP portable para Windows x64. No es un instalador firmado ni un paquete MSIX de Microsoft Store. TinyDock (`tinydock.pro`) publica fichas de proyectos y enlaza las descargas externamente; no aloja ni distribuye ejecutables.

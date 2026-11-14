@@ -1,6 +1,6 @@
 # Historial de cambios
 
-## 1.0.0 — 2026-11-12
+## 1.0.0 — 2026-11-14
 - Evitadas categorías duplicadas por diferencias de mayúsculas, incluso al renombrar o escribir una categoría en el editor.
 - Persisten las categorías vacías y se pueden incluir en los respaldos JSON.
 - Los respaldos validan los datos antes de importar, conservan la biblioteca ante archivos inválidos y siguen aceptando el formato anterior.
